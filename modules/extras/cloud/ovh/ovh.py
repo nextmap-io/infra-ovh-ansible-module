@@ -22,6 +22,8 @@ description:
     - List dedicated servers, personal templates
     - Create a template from a yml file inside an ansible role (see README)
     - Terminate a dedicated server (doesn't confirm termination, has to be done manually)
+    - Create an user with limited access to a single container on Public Cloud Storage
+    - Create or get a container on Public Cloud Storage
 author: Francois BRUNHES and Synthesio SRE Team
 notes:
     - In /etc/ovh.conf (on host that executes module), you should add your
@@ -54,7 +56,7 @@ options:
             description: The consumer key to use to connect to the API
     name:
         required: true
-        description: The name of the service (dedicated, dns)
+        description: The name of the service (dedicated, dns, public cloud project)
     state:
         required: false
         default: present
@@ -64,7 +66,7 @@ options:
               or deleted
     service:
         required: true
-        choices: ['boot', 'dns', 'vrack', 'reverse', 'monitoring', 'install', 'status', 'list', 'template', 'terminate']
+        choices: ['boot', 'dns', 'vrack', 'reverse', 'monitoring', 'install', 'status', 'list', 'template', 'terminate', 'openstack', 'pcs']
         description:
             - Determines the service you want to use in the module
               boot, change the bootid and can reboot the dedicated server
@@ -114,7 +116,31 @@ options:
         default: None
         description:
             - The hostname you want to replace in /etc/hostname when applying a template
-
+    container: 
+        required: false
+        default: None
+        description:
+            - The container you want to edit
+    description: 
+        required: false
+        default: None
+        description:
+            - The description to be set on object (user...)
+    right: 
+        required: false
+        default: 'all'
+        description:
+            - The permission to grant on user (all,read,write)
+    region: 
+        required: false
+        default: None
+        description:
+            - The cloud region to work in (GRA1,GRA5,SBG1...)
+    archive: 
+        required: false
+        default: False
+        description:
+            - Bucket mode (archive/classic)
 '''
 
 EXAMPLES = '''
@@ -177,6 +203,14 @@ EXAMPLES = '''
 
 - name: Delete template
   ovh: service='template' name='{{ template }}' state='absent'
+  run_once: yes
+
+- name: Create OpenStack PCS container on given region 
+  ovh: service='pcs' name='project-uid' archive=false container='container-uid' region='SBG1' state='present'
+  run_once: yes
+
+- name: Create OpenStack user with limited access to a pcs container 
+  ovh: service='openstack' name='project-uid' description='bar' right='all' container='container-uid' region='SBG1' state='present'
   run_once: yes
 '''
 
@@ -571,6 +605,57 @@ def listTemplates(ovhclient, module):
                 module.fail_json(changed=False, msg="Failed to call OVH API: {0}".format(apiError))
         module.exit_json(changedFalse=False, objects=customlist)
 
+def createPcsContainer(ovhclient, module):
+    details = {"archive":module.params['archive'], "containerName":module.params['container'], "region":module.params['region']}
+    container = None
+
+    try:
+        result = ovhclient.get('/cloud/project/%s/storage' % module.params['name'])
+    except APIError as apiError:
+        module.fail_json(changed=False, msg="Failed to call OVH API: {0}".format(apiError))
+
+    for cnt in result:
+        if (cnt['name'] == details['containerName'] and cnt['region'] == details['region']):
+            container = cnt 
+
+    if container and module.params['status'] == 'present':        
+        return module.exit_json(changed=True, objects=container)
+    elif container and module.params['status'] == 'absent':
+        result = ovhclient.delete('/cloud/project/%s/storage/%s' % (module.params['name'], container['id']))
+        return module.exit_json(changed=True, objects=result)
+    elif module.params['status'] == 'absent':
+        return module.exit_json(changed=False)
+
+    try:
+        result = ovhclient.post('/cloud/project/%s/storage' % module.params['name'], **details)
+        module.exit_json(changed=True, objects=result)
+    except APIError as apiError:
+        module.fail_json(changed=False, msg="Failed to call OVH API: {0}".format(apiError))
+
+def createLimitedAccessPcsUser(ovhclient, module):
+    details = {"description":module.params['description'], "right":module.params['right']}
+
+    container = None
+
+    try:
+        result = ovhclient.get('/cloud/project/%s/storage' % module.params['name'])
+    except APIError as apiError:
+        module.fail_json(changed=False, msg="Failed to call OVH API: {0}".format(apiError))
+
+    for cnt in result:
+        if (cnt['name'] == module.params['container'] and cnt['region'] == module.params['region']):
+            container = cnt
+            break
+
+    if container is None:
+        return module.fail_json(changed=False, msg="Container not found")
+    
+    try:
+        result = ovhclient.post('/cloud/project/%s/storage/%s/user' % (module.params['name'], container['id']), **details)
+        module.exit_json(changed=True, objects=result)
+    except APIError as apiError:
+        module.fail_json(changed=False, msg="Failed to call OVH API: {0}".format(apiError))
+
 def main():
     module = AnsibleModule(
             argument_spec = dict(
@@ -580,7 +665,7 @@ def main():
                 consumer_key = dict(required=False, default=None),
                 state = dict(default='present', choices=['present', 'absent', 'modified']),
                 name  = dict(required=True),
-                service = dict(choices=['boot', 'dns', 'vrack', 'reverse', 'monitoring', 'install', 'status', 'list', 'template', 'terminate'], required=True),
+                service = dict(choices=['boot', 'dns', 'vrack', 'reverse', 'monitoring', 'install', 'status', 'list', 'template', 'terminate', 'pcs', 'openstack'], required=True),
                 domain = dict(required=False, default=None),
                 ip    = dict(required=False, default=None),
                 vrack = dict(required=False, default=None),
@@ -589,7 +674,12 @@ def main():
                 template = dict(required=False, default=None),
                 hostname = dict(required=False, default=None),
                 ssh_key_name = dict(required=False, default=None),
-                use_distrib_kernel = dict(required=False, type='bool', default=False)
+                use_distrib_kernel = dict(required=False, type='bool', default=False),
+                container = dict(required=False, default=None),
+                description = dict(required=False, default=None),
+                right = dict(required=False, default='all'),
+                region = dict(required=False, default=None),
+                archive = dict(required=False, type='bool', default=False),
                 ),
             supports_check_mode=True
             )
@@ -629,7 +719,10 @@ def main():
         generateTemplate(client, module)
     elif module.params['service'] == 'terminate':
         terminateServer(client, module)
-
-
+    elif module.params['service'] == 'pcs':
+        createPcsContainer(client, module)
+    elif module.params['service'] == 'openstack':
+        createLimitedAccessPcsUser(client, module)
+    
 if __name__ == '__main__':
         main()
