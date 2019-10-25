@@ -618,12 +618,12 @@ def createPcsContainer(ovhclient, module):
         if (cnt['name'] == details['containerName'] and cnt['region'] == details['region']):
             container = cnt 
 
-    if container and module.params['status'] == 'present':        
-        return module.exit_json(changed=True, objects=container)
-    elif container and module.params['status'] == 'absent':
+    if container and module.params['state'] == 'present':        
+        return module.exit_json(changed=False, objects=container)
+    elif container and module.params['state'] == 'absent':
         result = ovhclient.delete('/cloud/project/%s/storage/%s' % (module.params['name'], container['id']))
         return module.exit_json(changed=True, objects=result)
-    elif module.params['status'] == 'absent':
+    elif module.params['state'] == 'absent':
         return module.exit_json(changed=False)
 
     try:
